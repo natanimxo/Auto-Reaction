@@ -37,10 +37,18 @@ class MasterBot:
         self.reaction_manager = reaction_manager
         self.application = None
 
+    async def post_init(self, application: Application):
+        """Called by PTB after the Application is initialized, before polling."""
+        logger.info("Running post-init setup...")
+        await self.db.initialize()
+        bot_count = await self.reaction_manager.initialize_bots()
+        logger.info(f"Initialized {bot_count} reaction bots")
+
     async def initialize(self):
         self.application = (
             Application.builder()
             .token(self.config.MASTER_BOT_TOKEN)
+            .post_init(self.post_init)
             .build()
         )
         self._register_handlers()
@@ -375,4 +383,7 @@ class MasterBot:
 
     def run(self):
         logger.info("Starting master bot polling...")
-        self.application.run_polling()
+        self.application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
