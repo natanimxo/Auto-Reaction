@@ -31,11 +31,11 @@ class ReactionManager:
                 }
                 logger.info(f"Bot initialized: @{me.username}")
             except Forbidden:
-                logger.error(f"Bot token forbidden, deactivating.")
+                logger.error("Bot token forbidden, deactivating.")
                 if bot_data.get('bot_username'):
                     await self.db.set_bot_active(bot_data['bot_username'], False)
             except BadRequest:
-                logger.error(f"Bot token invalid, deactivating.")
+                logger.error("Bot token invalid, deactivating.")
                 if bot_data.get('bot_username'):
                     await self.db.set_bot_active(bot_data['bot_username'], False)
             except Exception as e:
