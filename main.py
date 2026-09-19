@@ -1,4 +1,3 @@
-# main.py
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
@@ -11,11 +10,13 @@ from master_bot import MasterBot
 
 def setup_logging():
     logging.basicConfig(
-        level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=getattr(Config, "LOG_LEVEL", logging.INFO),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             RotatingFileHandler(
-                Config.LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5
+                Config.LOG_FILE,
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5
             ),
             logging.StreamHandler(sys.stdout),
         ]
@@ -30,3 +31,18 @@ def main():
     logger.info("Config validated")
 
     db = Database(Config.DB_PATH)
+
+    reaction_manager = ReactionManager(db)
+
+    master_bot = MasterBot(
+        config=Config,
+        database=db,
+        reaction_manager=reaction_manager
+    )
+
+    logger.info("Starting master bot...")
+    master_bot.run()
+
+
+if __name__ == "__main__":
+    main()
