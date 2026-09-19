@@ -1,5 +1,4 @@
 # main.py
-import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
@@ -8,6 +7,8 @@ from config import Config
 from database import Database
 from reaction_manager import ReactionManager
 from master_bot import MasterBot
+
+import asyncio
 
 
 def setup_logging():
@@ -23,8 +24,8 @@ def setup_logging():
     )
 
 
-async def async_main():
-    setup_logging()
+async def async_setup():
+    """Do all async setup WITHOUT running the bot's event loop."""
     logger = logging.getLogger(__name__)
 
     Config.validate()
@@ -38,13 +39,26 @@ async def async_main():
     logger.info(f"Initialized {bot_count} reaction bots")
 
     master_bot = MasterBot(Config, db, reaction_manager)
+    # Initialize the Application object (this is sync-ish, safe to await)
     await master_bot.initialize()
 
     return master_bot
 
 
 def main():
-    master_bot = asyncio.run(async_main())
+    setup_logging()
+    logger = logging.getLogger(__name__)
+
+    # Run our own async setup in a temporary loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        master_bot = loop.run_until_complete(async_setup())
+    finally:
+        # We're done with this temp loop; close it before PTB takes over
+        loop.close()
+
+    # Now hand control to PTB's run_polling(), which creates ITS OWN loop
     master_bot.run()
 
 
