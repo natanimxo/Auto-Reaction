@@ -30,13 +30,3 @@ def main():
     logger.info("Config validated")
 
     db = Database(Config.DB_PATH)
-    reaction_manager = ReactionManager(db)
-    master_bot = MasterBot(Config, db, reaction_manager)
-
-    # PTB's run_polling() creates and owns its own event loop.
-    # post_init() inside MasterBot will do all async setup.
-    master_bot.run()
-
-
-if __name__ == "__main__":
-    main()
