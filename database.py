@@ -53,7 +53,6 @@ class Database:
             await db.commit()
             logger.info("Database initialized")
 
-    # --- channels ---
     async def add_channel(self, channel_id: str, channel_name: str = None) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
@@ -104,7 +103,6 @@ class Database:
             await db.commit()
             return cur.rowcount > 0
 
-    # --- bots ---
     async def add_bot_token(self, token: str, username: str,
                             daily_limit: int = 250) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
@@ -165,7 +163,6 @@ class Database:
                 logger.info(f"Reset daily counters for {cur.rowcount} bots")
             return cur.rowcount
 
-    # --- logging / stats ---
     async def log_reaction(self, channel_id: str, post_id: int,
                            bot_username: str, emoji: str,
                            success: bool = True, error: str = None) -> bool:
