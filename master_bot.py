@@ -38,13 +38,14 @@ class MasterBot:
         self.application = None
 
     async def post_init(self, application: Application):
-        """Called by PTB after the Application is initialized, before polling."""
+        """PTB calls this inside its own event loop, after Application.initialize()."""
         logger.info("Running post-init setup...")
         await self.db.initialize()
         bot_count = await self.reaction_manager.initialize_bots()
         logger.info(f"Initialized {bot_count} reaction bots")
 
-    async def initialize(self):
+    def build(self):
+        """Build the Application object. Sync — safe from main()."""
         self.application = (
             Application.builder()
             .token(self.config.MASTER_BOT_TOKEN)
@@ -382,6 +383,8 @@ class MasterBot:
         )
 
     def run(self):
+        if self.application is None:
+            self.build()
         logger.info("Starting master bot polling...")
         self.application.run_polling(
             allowed_updates=Update.ALL_TYPES,
