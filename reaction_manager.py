@@ -2,209 +2,191 @@
 import asyncio
 import random
 import logging
-from typing import List, Optional, Dict
-from datetime import datetime, timedelta
+from typing import List, Dict
+
 from telegram import Bot
-from telegram.error import TelegramError, RetryAfter, Unauthorized
+from telegram.error import TelegramError, RetryAfter, Forbidden, BadRequest
 
 logger = logging.getLogger(__name__)
+
 
 class ReactionManager:
     def __init__(self, database):
         self.db = database
-        self.bot_instances = {}  # Cache bot instances
-        self.reaction_queue = asyncio.Queue()
-        self.active_jobs = {}
-        
-    async def initialize_bots(self):
-        """Initialize bot instances from database"""
+        self.bot_instances: Dict[str, Dict] = {}
+        self.active_jobs: Dict[str, asyncio.Task] = {}
+
+    async def initialize_bots(self) -> int:
+        await self.db.reset_daily_counts()
         bots = await self.db.get_active_bots()
         for bot_data in bots:
             token = bot_data['bot_token']
             try:
                 bot = Bot(token)
-                # Verify bot is valid
                 me = await bot.get_me()
                 self.bot_instances[me.username] = {
                     'bot': bot,
                     'username': me.username,
-                    'token': token
+                    'token': token,
                 }
                 logger.info(f"Bot initialized: @{me.username}")
+            except Forbidden:
+                logger.error(f"Bot token forbidden, deactivating.")
+                if bot_data.get('bot_username'):
+                    await self.db.set_bot_active(bot_data['bot_username'], False)
+            except BadRequest:
+                logger.error(f"Bot token invalid, deactivating.")
+                if bot_data.get('bot_username'):
+                    await self.db.set_bot_active(bot_data['bot_username'], False)
             except Exception as e:
-                logger.error(f"Failed to initialize bot: {e}")
-        
+                logger.error(f"Failed to init bot: {e}")
         return len(self.bot_instances)
-    
-    async def schedule_reactions(self, channel_id: str, post_id: int, post_text: str):
-        """Schedule staggered reactions for a new post"""
-        # Check if post has [no-react] keyword
-        if '[no-react]' in post_text.lower():
-            logger.info(f"Skipping reactions for post {post_id} in {channel_id} (no-react keyword)")
+
+    async def add_bot(self, token: str) -> str:
+        bot = Bot(token)
+        me = await bot.get_me()
+        await self.db.add_bot_token(token, me.username)
+        self.bot_instances[me.username] = {
+            'bot': bot,
+            'username': me.username,
+            'token': token,
+        }
+        return me.username
+
+    async def shutdown(self):
+        for task in list(self.active_jobs.values()):
+            task.cancel()
+        if self.active_jobs:
+            await asyncio.gather(*self.active_jobs.values(), return_exceptions=True)
+        self.active_jobs.clear()
+
+    async def schedule_reactions(self, channel_id: str, post_id: int,
+                                 post_text: str):
+        if '[no-react]' in (post_text or '').lower():
+            logger.info(f"[no-react] skipping post {post_id}")
             return
-        
-        # Get channel settings
+
         channel = await self.db.get_channel(channel_id)
         if not channel or not channel['react_mode']:
-            logger.info(f"Reactions disabled for channel {channel_id}")
+            logger.info(f"Reactions disabled/unknown for {channel_id}")
             return
-        
-        # Calculate number of reactions
-        min_reactions = channel['min_reactions']
-        max_reactions = channel['max_reactions']
-        num_reactions = random.randint(min_reactions, max_reactions)
-        
-        # Get available bots
-        available_bots = list(self.bot_instances.keys())
-        if not available_bots:
-            logger.error("No bots available for reactions")
+
+        available = list(self.bot_instances.keys())
+        if not available:
+            logger.error("No bots available")
             return
-        
-        # Limit reactions to available bots
-        num_reactions = min(num_reactions, len(available_bots))
-        
-        # Select random bots
-        selected_bots = random.sample(available_bots, num_reactions)
-        
-        # Get emoji list
-        emoji_list = channel.get('emoji_list', '👍,❤️,🔥').split(',')
-        
-        # Create staggered schedule
-        max_delay = channel['max_delay_minutes']
-        schedule = self._create_staggered_schedule(num_reactions, max_delay)
-        
-        # Schedule each reaction
-        for i, (bot_username, delay) in enumerate(zip(selected_bots, schedule)):
-            emoji = random.choice(emoji_list)
-            
-            # Create async task
+
+        num = random.randint(channel['min_reactions'], channel['max_reactions'])
+        num = max(1, min(num, len(available)))
+        selected = random.sample(available, num)
+
+        emojis = [
+            e.strip()
+            for e in (channel.get('emoji_list') or '👍,❤️,🔥').split(',')
+            if e.strip()
+        ] or ['👍']
+
+        delays = self._create_staggered_schedule(num, channel['max_delay_minutes'])
+
+        for i, (bot_user, delay) in enumerate(zip(selected, delays)):
+            emoji = random.choice(emojis)
             task = asyncio.create_task(
-                self._delayed_reaction(
-                    channel_id, post_id, bot_username, emoji, delay
-                )
+                self._delayed_reaction(channel_id, post_id, bot_user, emoji, delay)
             )
-            
-            # Store task reference
             job_id = f"{channel_id}_{post_id}_{i}"
             self.active_jobs[job_id] = task
-            
-            # Add cleanup callback
             task.add_done_callback(
                 lambda t, jid=job_id: self.active_jobs.pop(jid, None)
             )
-    
-    def _create_staggered_schedule(self, num_reactions: int, max_delay_minutes: int) -> List[float]:
-        """Create staggered timing schedule"""
-        schedule = []
-        
-        if num_reactions <= 3:
-            # All in first wave
-            for _ in range(num_reactions):
-                schedule.append(random.uniform(60, 180))  # 1-3 minutes
-        elif num_reactions <= 7:
-            # Two waves
-            first_wave = random.randint(1, 3)
-            second_wave = num_reactions - first_wave
-            
-            for _ in range(first_wave):
-                schedule.append(random.uniform(60, 180))  # 1-3 minutes
-            
-            for _ in range(second_wave):
-                schedule.append(random.uniform(300, 600))  # 5-10 minutes
+
+    def _create_staggered_schedule(self, n: int, max_delay_minutes: int) -> List[float]:
+        max_seconds = max(60, max_delay_minutes * 60)
+        schedule: List[float] = []
+
+        if n <= 3:
+            for _ in range(n):
+                schedule.append(random.uniform(60, min(180, max_seconds)))
+        elif n <= 7:
+            first = random.randint(1, min(3, n))
+            second = n - first
+            for _ in range(first):
+                schedule.append(random.uniform(60, min(180, max_seconds)))
+            for _ in range(second):
+                schedule.append(random.uniform(300, min(600, max_seconds)))
         else:
-            # Three waves
-            first_wave = random.randint(1, 3)
-            second_wave = random.randint(2, 4)
-            third_wave = num_reactions - first_wave - second_wave
-            
-            for _ in range(first_wave):
-                schedule.append(random.uniform(60, 180))  # 1-3 minutes
-            
-            for _ in range(second_wave):
-                schedule.append(random.uniform(300, 600))  # 5-10 minutes
-            
-            for _ in range(third_wave):
-                schedule.append(random.uniform(900, max_delay_minutes * 60))  # 15-30+ minutes
-        
-        # Add small random jitter
-        schedule = [s + random.uniform(2, 5) for s in schedule]
-        
-        # Sort schedule
+            first = random.randint(1, 3)
+            second = random.randint(2, 4)
+            third = max(0, n - first - second)
+            for _ in range(first):
+                schedule.append(random.uniform(60, min(180, max_seconds)))
+            for _ in range(second):
+                schedule.append(random.uniform(300, min(600, max_seconds)))
+            for _ in range(third):
+                schedule.append(random.uniform(900, max_seconds))
+
+        schedule = [max(1.0, min(max_seconds, s + random.uniform(2, 5)))
+                    for s in schedule]
         schedule.sort()
-        
-        return schedule
-    
-    async def _delayed_reaction(self, channel_id: str, post_id: int, 
-                               bot_username: str, emoji: str, delay: float):
-        """Execute delayed reaction"""
+        while len(schedule) < n:
+            schedule.append(max_seconds)
+        return schedule[:n]
+
+    async def _delayed_reaction(self, channel_id: str, post_id: int,
+                                bot_username: str, emoji: str, delay: float):
         try:
-            # Wait for delay
             await asyncio.sleep(delay)
-            
-            # Get bot instance
+
             bot_data = self.bot_instances.get(bot_username)
             if not bot_data:
-                logger.error(f"Bot {bot_username} not found")
+                logger.error(f"Bot @{bot_username} not in cache")
                 return
-            
             bot = bot_data['bot']
-            
-            # Attempt reaction
+
             try:
-                # Send reaction
                 await bot.set_message_reaction(
                     chat_id=channel_id,
                     message_id=post_id,
-                    reaction=[{
-                        'type': 'emoji',
-                        'emoji': emoji
-                    }]
+                    reaction=[{'type': 'emoji', 'emoji': emoji}],
                 )
-                
-                # Log success
-                await self.db.log_reaction(
-                    channel_id, post_id, bot_username, emoji, True
-                )
-                
-                # Increment bot count
+                await self.db.log_reaction(channel_id, post_id,
+                                           bot_username, emoji, True)
                 await self.db.increment_bot_reaction_count(bot_username)
-                
-                logger.info(f"✅ Reaction added: @{bot_username} reacted {emoji} to post {post_id}")
-                
+                logger.info(f"OK @{bot_username} -> {emoji} on post {post_id}")
+
             except RetryAfter as e:
-                # Rate limited
-                logger.warning(f"Rate limited for {bot_username}: {e.retry_after}s")
-                await self.db.log_reaction(
-                    channel_id, post_id, bot_username, emoji, False, f"Rate limited: {e.retry_after}s"
-                )
-                
-                # Wait and retry once
-                await asyncio.sleep(e.retry_after + 1)
+                wait = int(getattr(e, 'retry_after', 5)) + 1
+                logger.warning(f"Rate-limited @{bot_username}, retry in {wait}s")
+                await asyncio.sleep(wait)
                 try:
                     await bot.set_message_reaction(
-                        chat_id=channel_id,
-                        message_id=post_id,
-                        reaction=[{'type': 'emoji', 'emoji': emoji}]
+                        chat_id=channel_id, message_id=post_id,
+                        reaction=[{'type': 'emoji', 'emoji': emoji}],
                     )
-                    await self.db.log_reaction(channel_id, post_id, bot_username, emoji, True)
-                    logger.info(f"✅ Reaction added after retry: @{bot_username}")
-                except Exception as retry_error:
-                    logger.error(f"Retry failed for {bot_username}: {retry_error}")
-                    
-            except Unauthorized:
-                # Bot token invalid
-                logger.error(f"Bot {bot_username} is unauthorized")
-                await self.db.log_reaction(
-                    channel_id, post_id, bot_username, emoji, False, "Unauthorized"
-                )
-                
+                    await self.db.log_reaction(channel_id, post_id,
+                                               bot_username, emoji, True)
+                    await self.db.increment_bot_reaction_count(bot_username)
+                except Exception as e2:
+                    await self.db.log_reaction(channel_id, post_id,
+                                               bot_username, emoji, False, str(e2))
+
+            except Forbidden as e:
+                logger.error(f"@{bot_username} forbidden - deactivating")
+                await self.db.set_bot_active(bot_username, False)
+                self.bot_instances.pop(bot_username, None)
+                await self.db.log_reaction(channel_id, post_id,
+                                           bot_username, emoji, False, f"Forbidden: {e}")
+
+            except BadRequest as e:
+                logger.error(f"BadRequest for @{bot_username}: {e}")
+                await self.db.log_reaction(channel_id, post_id,
+                                           bot_username, emoji, False, f"BadRequest: {e}")
+
             except TelegramError as e:
-                logger.error(f"Telegram error for {bot_username}: {e}")
-                await self.db.log_reaction(
-                    channel_id, post_id, bot_username, emoji, False, str(e)
-                )
-                
+                await self.db.log_reaction(channel_id, post_id,
+                                           bot_username, emoji, False, str(e))
+
         except asyncio.CancelledError:
-            logger.info(f"Reaction cancelled for {bot_username}")
+            logger.info(f"Cancelled reaction by @{bot_username}")
+            raise
         except Exception as e:
-            logger.error(f"Unexpected error in delayed reaction: {e}")
+            logger.exception(f"Unexpected error: {e}")
