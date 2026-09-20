@@ -99,35 +99,35 @@ class MasterBot:
 
     def _register_handlers(self):
 
-    self.application.add_handler(
-        CommandHandler("start", self.cmd_start)
-    )
-
-    self.application.add_handler(
-        CommandHandler("panel", self.cmd_start)
-    )
-
-    self.application.add_handler(
-        CommandHandler("help", self.cmd_help)
-    )
-
-    self.application.add_handler(
-        CallbackQueryHandler(self.handle_callback)
-    )
-
-    self.application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT,
-            self.handle_private_message
+        self.application.add_handler(
+            CommandHandler("start", self.cmd_start)
         )
-    )
 
-    self.application.add_handler(
-        MessageHandler(
-            filters.ChatType.CHANNEL,
-            self.handle_channel_post
+        self.application.add_handler(
+            CommandHandler("panel", self.cmd_start)
         )
-    )
+
+        self.application.add_handler(
+            CommandHandler("help", self.cmd_help)
+        )
+
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_callback)
+        )
+
+        self.application.add_handler(
+            MessageHandler(
+                filters.ChatType.PRIVATE & filters.TEXT,
+                self.handle_private_message
+            )
+        )
+
+        self.application.add_handler(
+            MessageHandler(
+                filters.ChatType.CHANNEL,
+                self.handle_channel_post
+            )
+        )
     # =========================================================
     # MAIN MENU
     # =========================================================
