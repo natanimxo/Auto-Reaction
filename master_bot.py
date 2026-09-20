@@ -107,9 +107,6 @@ class MasterBot:
             CommandHandler("panel", self.cmd_start)
         )
 
-        self.application.add_handler(
-            CommandHandler("help", self.cmd_help)
-        )
 
         self.application.add_handler(
             CallbackQueryHandler(self.handle_callback)
