@@ -4,10 +4,28 @@ import random
 import logging
 from typing import List, Dict
 
-from telegram import Bot
+from telegram import Bot, ReactionTypeEmoji
+from telegram.constants import ReactionEmoji
 from telegram.error import TelegramError, RetryAfter, Forbidden, BadRequest
 
 logger = logging.getLogger(__name__)
+
+# Telegram only accepts a fixed set of emoji as reactions. Compare against the
+# enum's values, exactly as PTB itself does.
+VALID_REACTION_EMOJIS = set(ReactionEmoji)
+
+
+def normalize_emojis(emojis: List[str]) -> List[str]:
+    """Make an emoji list safe for set_message_reaction.
+
+    - strips U+FE0F (variation selector): "\u2764\ufe0f" is not valid, "\u2764" is
+    - drops anything Telegram doesn't allow as a reaction
+    - falls back to thumbs-up if nothing valid remains
+    Applied at send time so old DB rows keep working without a migration.
+    """
+    cleaned = [e.replace("\ufe0f", "").strip() for e in emojis]
+    valid = [e for e in cleaned if e in VALID_REACTION_EMOJIS]
+    return valid or ["\U0001F44D"]
 
 
 class ReactionManager:
@@ -80,16 +98,18 @@ class ReactionManager:
         num = max(1, min(num, len(available)))
         selected = random.sample(available, num)
 
-        emojis = [
+        emojis = normalize_emojis([
             e.strip()
-            for e in (channel.get('emoji_list') or '👍,❤️,🔥').split(',')
+            for e in (channel.get('emoji_list') or '👍,❤,🔥').split(',')
             if e.strip()
-        ] or ['👍']
+        ])
 
         delays = self._create_staggered_schedule(num, channel['max_delay_minutes'])
 
+        plan = []
         for i, (bot_user, delay) in enumerate(zip(selected, delays)):
             emoji = random.choice(emojis)
+            plan.append(f"{bot_user}@{delay:.0f}s")
             task = asyncio.create_task(
                 self._delayed_reaction(channel_id, post_id, bot_user, emoji, delay)
             )
@@ -98,6 +118,12 @@ class ReactionManager:
             task.add_done_callback(
                 lambda t, jid=job_id: self.active_jobs.pop(jid, None)
             )
+
+        # Immediate proof that scheduling ran (the first "OK" is >= 60s away).
+        logger.info(
+            f"Scheduled {num} reactions for post {post_id} in {channel_id}: "
+            + " ".join(plan)
+        )
 
     def _create_staggered_schedule(self, n: int, max_delay_minutes: int) -> List[float]:
         max_seconds = max(60, max_delay_minutes * 60)
@@ -146,7 +172,7 @@ class ReactionManager:
                 await bot.set_message_reaction(
                     chat_id=channel_id,
                     message_id=post_id,
-                    reaction=[{'type': 'emoji', 'emoji': emoji}],
+                    reaction=[ReactionTypeEmoji(emoji=emoji)],
                 )
                 await self.db.log_reaction(channel_id, post_id,
                                            bot_username, emoji, True)
@@ -160,7 +186,7 @@ class ReactionManager:
                 try:
                     await bot.set_message_reaction(
                         chat_id=channel_id, message_id=post_id,
-                        reaction=[{'type': 'emoji', 'emoji': emoji}],
+                        reaction=[ReactionTypeEmoji(emoji=emoji)],
                     )
                     await self.db.log_reaction(channel_id, post_id,
                                                bot_username, emoji, True)
@@ -170,14 +196,14 @@ class ReactionManager:
                                                bot_username, emoji, False, str(e2))
 
             except Forbidden as e:
-                logger.error(f"@{bot_username} forbidden - deactivating")
+                logger.error(f"@{bot_username} forbidden in {channel_id} - deactivating")
                 await self.db.set_bot_active(bot_username, False)
                 self.bot_instances.pop(bot_username, None)
                 await self.db.log_reaction(channel_id, post_id,
                                            bot_username, emoji, False, f"Forbidden: {e}")
 
             except BadRequest as e:
-                logger.error(f"BadRequest for @{bot_username}: {e}")
+                logger.error(f"BadRequest for @{bot_username} in {channel_id}: {e}")
                 await self.db.log_reaction(channel_id, post_id,
                                            bot_username, emoji, False, f"BadRequest: {e}")
 

@@ -18,7 +18,7 @@ class Config:
     MIN_DELAY_MINUTES = int(os.getenv('MIN_DELAY_MINUTES', 1))
     MAX_DELAY_MINUTES = int(os.getenv('MAX_DELAY_MINUTES', 30))
 
-    DEFAULT_EMOJIS = ['👍', '❤️', '🔥', '😂', '😍', '👏', '💯', '🎉', '🤩', '🙌']
+    DEFAULT_EMOJIS = ['👍', '❤', '🔥', '🤣', '😍', '👏', '💯', '🎉', '🤩', '🙏']
 
     DAILY_LIMIT_PER_BOT = int(os.getenv('DAILY_LIMIT_PER_BOT', 250))
     MAX_BOTS = int(os.getenv('MAX_BOTS', 50))

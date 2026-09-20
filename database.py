@@ -22,7 +22,7 @@ class Database:
                     min_reactions INTEGER DEFAULT 5,
                     max_reactions INTEGER DEFAULT 11,
                     max_delay_minutes INTEGER DEFAULT 30,
-                    emoji_list TEXT DEFAULT '👍,❤️,🔥,😂,😍,👏,💯,🎉,🤩,🙌',
+                    emoji_list TEXT DEFAULT '👍,❤,🔥,🤣,😍,👏,💯,🎉,🤩,🙏',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')

@@ -7,12 +7,13 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    TypeHandler,
     ContextTypes,
     filters,
 )
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_EMOJIS = ['👍', '❤️', '🔥', '😂', '😍', '👏', '💯', '🎉', '🤩', '🙌']
+DEFAULT_EMOJIS = ['👍', '❤', '🔥', '🤣', '😍', '👏', '💯', '🎉', '🤩', '🙏']
 
 
 class MasterBot:
@@ -53,9 +54,53 @@ class MasterBot:
         await self.db.initialize()
         bot_count = await self.reaction_manager.initialize_bots()
         logger.info(f"Initialized {bot_count} reaction bots")
+        await self._startup_self_check(application)
+
+    async def _startup_self_check(self, application: Application):
+        """Log facts that prove (or disprove) that this token can see channel posts.
+
+        Wrapped in try/except: a diagnostic must never be able to crash startup.
+        """
+        try:
+            me = await application.bot.get_me()
+            logger.info(f"Master bot is @{me.username} (id {me.id})")
+
+            # getUpdates and webhooks are mutually exclusive: with a webhook set,
+            # Telegram delivers nothing to polling.
+            wh = await application.bot.get_webhook_info()
+            logger.info(
+                f"Webhook url={wh.url!r} (must be empty) "
+                f"pending_update_count={wh.pending_update_count} "
+                f"last_error_message={wh.last_error_message!r}"
+            )
+
+            for ch in await self.db.get_all_channels():
+                cid = ch["channel_id"]
+                try:
+                    member = await application.bot.get_chat_member(cid, me.id)
+                    logger.info(f"Channel {cid}: master bot status={member.status}")
+                    if member.status not in (ChatMemberStatus.ADMINISTRATOR,
+                                             ChatMemberStatus.OWNER):
+                        logger.error(
+                            f"Channel {cid}: master bot is NOT an admin "
+                            f"(status={member.status}). MASTER_BOT_TOKEN may belong "
+                            "to a different bot than the one made admin."
+                        )
+                except Exception as e:
+                    logger.error(f"Channel {cid}: get_chat_member failed: {e}")
+        except Exception as e:
+            logger.error(f"Startup self-check failed: {e}")
 
     def _register_handlers(self):
         h = self.application.add_handler
+
+        # DEBUG TAP. Handlers are grouped; PTB runs at most ONE matching handler
+        # per group, but every group is visited. Group -1 runs before the default
+        # group 0 and is its own group, so this logger sees every update and can
+        # never stop the real handlers below. If "kinds=['channel_post']" shows up
+        # after you post, Telegram is delivering; if it never does, the problem is
+        # outside the code (wrong token, or another process polling the same token).
+        h(TypeHandler(Update, self._log_update), group=-1)
         h(CommandHandler("start", self.cmd_start))
         h(CommandHandler("panel", self.cmd_start))
         h(CommandHandler("help", self.cmd_help))
@@ -64,8 +109,13 @@ class MasterBot:
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             self.handle_private_message
         ))
+        # An Update has exactly one payload field: message, edited_message,
+        # channel_post, edited_channel_post, ... filters.ChatType.CHANNEL only checks
+        # chat.type, so it also matched edited_channel_post (editing a post would
+        # re-trigger reactions). filters.UpdateType.CHANNEL_POST checks WHICH field
+        # is set, so it matches brand-new channel posts only.
         h(MessageHandler(
-            filters.ChatType.CHANNEL,
+            filters.UpdateType.CHANNEL_POST,
             self.handle_channel_post
         ))
 
@@ -225,7 +275,7 @@ class MasterBot:
                 if not ch:
                     await query.edit_message_text("❌ Channel gone.")
                     return
-                current = [e for e in (ch.get("emoji_list") or "").split(",") if e]
+                current = [e.replace("\ufe0f", "") for e in (ch.get("emoji_list") or "").split(",") if e]
                 if not current:
                     current = list(DEFAULT_EMOJIS)
                 emoji = DEFAULT_EMOJIS[int(idx)]
@@ -357,7 +407,7 @@ class MasterBot:
 
         stats = await self.db.get_stats(channel_id)
         status = "🟢 ON" if ch["react_mode"] else "🔴 OFF"
-        emojis = ch.get("emoji_list") or "👍,❤️,🔥"
+        emojis = ch.get("emoji_list") or "👍,❤,🔥"
 
         text = (
             f"📢 *{ch.get('channel_name') or ch['channel_id']}*\n\n"
@@ -426,7 +476,8 @@ class MasterBot:
             await query.edit_message_text("❌ Channel gone.")
             return
 
-        current = [e for e in (ch.get("emoji_list") or "").split(",") if e]
+        # Strip U+FE0F so legacy "❤️" rows still match the picker's "❤".
+        current = [e.replace("\ufe0f", "") for e in (ch.get("emoji_list") or "").split(",") if e]
         if not current:
             current = list(DEFAULT_EMOJIS)
 
@@ -633,8 +684,21 @@ class MasterBot:
             try:
                 chat = await context.bot.get_chat(channel_id)
                 name = chat.title or chat.username or channel_id
+                # Incoming posts carry the numeric -100... id, and get_channel() is
+                # an exact match, so always store the numeric id, never "@name".
+                channel_id = str(chat.id)
             except TelegramError:
-                pass
+                if not channel_id.lstrip("-").isdigit():
+                    # An unresolved @username would be stored under a key that can
+                    # never match a post. Stay in the "awaiting" state so they can retry.
+                    await update.effective_message.reply_text(
+                        "❌ I couldn't resolve that @username / link.\n\n"
+                        "Send the numeric ID (starting with `-100`) or *forward* a "
+                        "message from the channel instead.\n\n"
+                        "Send `cancel` to abort.",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
 
             added = await self.db.add_channel(channel_id, name)
             context.user_data.clear()
@@ -737,12 +801,34 @@ class MasterBot:
     # CHANNEL POSTS
     # =======================================================================
 
+    async def _log_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Update.to_dict() only contains fields that are set, so the keys (minus
+        # update_id) say which kind of update this is. Log nothing sensitive.
+        kinds = [k for k in update.to_dict() if k != "update_id"]
+        chat = update.effective_chat
+        logger.info(
+            f"UPDATE id={update.update_id} kinds={kinds} "
+            f"chat_id={chat.id if chat else None}"
+        )
+
     async def handle_channel_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         channel_id = str(update.effective_chat.id)
-        if not await self.db.get_channel(channel_id):
-            return
         msg = update.effective_message
         post_text = msg.text or msg.caption or ""
+        logger.info(
+            f"handle_channel_post: channel={channel_id} message_id={msg.message_id} "
+            f"text={post_text[:40]!r}"
+        )
+
+        # get_channel() is an exact string match. A miss used to `return` silently,
+        # which looks identical to "the handler never ran".
+        if not await self.db.get_channel(channel_id):
+            known = [c["channel_id"] for c in await self.db.get_all_channels()]
+            logger.warning(
+                f"Post in UNREGISTERED channel {channel_id}; registered ids: {known}"
+            )
+            return
+
         try:
             await self.reaction_manager.schedule_reactions(
                 channel_id, msg.message_id, post_text

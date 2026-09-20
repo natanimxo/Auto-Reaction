@@ -21,6 +21,11 @@ def setup_logging():
             logging.StreamHandler(sys.stdout),
         ]
     )
+    # httpx logs each request URL at INFO, and Bot API URLs look like
+    # https://api.telegram.org/bot<TOKEN>/getUpdates, so the token would land in
+    # every log line. WARNING hides successful requests but keeps real problems.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def main():
