@@ -1,391 +1,834 @@
 # master_bot.py
-import logging
-from typing import Dict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import logging
+from functools import wraps
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
+
 from telegram.error import TelegramError
 
 logger = logging.getLogger(__name__)
 
 
-def admin_only(func):
-    async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if not user or user.id not in self.config.ADMIN_USER_IDS:
-            target = update.effective_message or (
-                update.callback_query.message if update.callback_query else None
-            )
-            if target:
-                try:
-                    await target.reply_text("Unauthorized.")
-                except TelegramError:
-                    pass
-            return
-        return await func(self, update, context)
-    return wrapper
-
-
 class MasterBot:
+
     def __init__(self, config, database, reaction_manager):
         self.config = config
         self.db = database
         self.reaction_manager = reaction_manager
         self.application = None
 
-    async def post_init(self, application: Application):
-        """PTB calls this inside its own event loop, after Application.initialize()."""
-        logger.info("Running post-init setup...")
-        await self.db.initialize()
-        bot_count = await self.reaction_manager.initialize_bots()
-        logger.info(f"Initialized {bot_count} reaction bots")
+    # =========================================================
+    # ADMIN CHECK
+    # =========================================================
+
+    def admin_only(self, func):
+
+        @wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+            user = update.effective_user
+
+            if not user or user.id not in self.config.ADMIN_USER_IDS:
+
+                message = update.effective_message
+
+                if message:
+                    try:
+                        await message.reply_text(
+                            "⛔ You are not authorized to use this bot."
+                        )
+                    except TelegramError:
+                        pass
+
+                return
+
+            return await func(update, context)
+
+        return wrapper
+
+    # =========================================================
+    # BUILD APPLICATION
+    # =========================================================
 
     def build(self):
-        """Build the Application object. Sync — safe from main()."""
+
         self.application = (
             Application.builder()
             .token(self.config.MASTER_BOT_TOKEN)
             .post_init(self.post_init)
             .build()
         )
+
         self._register_handlers()
+
         logger.info("MasterBot initialized")
 
+    # =========================================================
+    # POST INIT
+    # =========================================================
+
+    async def post_init(self, application: Application):
+
+        logger.info("Running post-init setup...")
+
+        await self.db.initialize()
+
+        bot_count = await self.reaction_manager.initialize_bots()
+
+        logger.info(
+            f"Initialized {bot_count} reaction bots"
+        )
+
+    # =========================================================
+    # HANDLERS
+    # =========================================================
+
     def _register_handlers(self):
-        h = self.application.add_handler
-        h(CommandHandler("start", self.cmd_start))
-        h(CommandHandler("help", self.cmd_help))
-        h(CommandHandler("panel", self.cmd_panel))
-        h(CommandHandler("add_channel", self.cmd_add_channel))
-        h(CommandHandler("remove_channel", self.cmd_remove_channel))
-        h(CommandHandler("react_on", self.cmd_react_on))
-        h(CommandHandler("react_off", self.cmd_react_off))
-        h(CommandHandler("toggle", self.cmd_toggle))
-        h(CommandHandler("react_status", self.cmd_status))
-        h(CommandHandler("set_count", self.cmd_set_count))
-        h(CommandHandler("channels", self.cmd_channels))
-        h(CommandHandler("add_bot", self.cmd_add_bot))
-        h(CommandHandler("list_bots", self.cmd_list_bots))
-        h(CommandHandler("stats", self.cmd_stats))
-        h(CallbackQueryHandler(self.handle_callback))
-        h(MessageHandler(filters.ChatType.CHANNEL, self.handle_channel_post))
 
-    @admin_only
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self.show_control_panel(update, context, edit=False)
+    self.application.add_handler(
+        CommandHandler("start", self.cmd_start)
+    )
 
-    @admin_only
-    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = (
-            "*Auto-Reaction Bot Control*\n\n"
-            "*Channels:*\n"
-            "`/add_channel <id> [name]`\n"
-            "`/remove_channel <id>`\n"
-            "`/channels`\n\n"
-            "*Reactions:*\n"
-            "`/react_on <id>`  `/react_off <id>`  `/toggle <id>`\n"
-            "`/react_status <id>`\n"
-            "`/set_count <id> <1-15>`\n\n"
-            "*Bots:*\n"
-            "`/add_bot <token>`  `/list_bots`\n\n"
-            "*Other:*\n"
-            "`/panel`  `/stats`"
+    self.application.add_handler(
+        CommandHandler("panel", self.cmd_start)
+    )
+
+    self.application.add_handler(
+        CommandHandler("help", self.cmd_help)
+    )
+
+    self.application.add_handler(
+        CallbackQueryHandler(self.handle_callback)
+    )
+
+    self.application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT,
+            self.handle_private_message
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    )
 
-    @admin_only
-    async def cmd_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self.show_control_panel(update, context, edit=False)
-
-    @admin_only
-    async def cmd_add_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text(
-                "Usage: `/add_channel -1001234567890 [Name]`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        channel_id = context.args[0]
-        name = " ".join(context.args[1:]) or channel_id
-        added = await self.db.add_channel(channel_id, name)
-        if added:
-            await update.message.reply_text(
-                f"Added channel `{channel_id}`.", parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text("Channel already registered.")
-
-    @admin_only
-    async def cmd_remove_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text("Usage: `/remove_channel <id>`",
-                                            parse_mode=ParseMode.MARKDOWN)
-            return
-        ok = await self.db.remove_channel(context.args[0])
-        await update.message.reply_text("Removed." if ok else "Not found.")
-
-    @admin_only
-    async def cmd_react_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._set_mode(update, context, True)
-
-    @admin_only
-    async def cmd_react_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._set_mode(update, context, False)
-
-    @admin_only
-    async def cmd_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text("Usage: `/toggle <channel_id>`",
-                                            parse_mode=ParseMode.MARKDOWN)
-            return
-        cid = context.args[0]
-        channel = await self.db.get_channel(cid)
-        if not channel:
-            await update.message.reply_text("Channel not registered.")
-            return
-        new_mode = not bool(channel['react_mode'])
-        await self.db.update_channel_react_mode(cid, new_mode)
-        await update.message.reply_text(
-            f"{'ENABLED' if new_mode else 'DISABLED'} for `{cid}`",
-            parse_mode=ParseMode.MARKDOWN
+    self.application.add_handler(
+        MessageHandler(
+            filters.ChatType.CHANNEL,
+            self.handle_channel_post
         )
+    )
 
-    @admin_only
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text("Usage: `/react_status <channel_id>`",
-                                            parse_mode=ParseMode.MARKDOWN)
-            return
-        channel = await self.db.get_channel(context.args[0])
-        if not channel:
-            await update.message.reply_text("Not registered.")
-            return
-        status = "ENABLED" if channel['react_mode'] else "DISABLED"
-        await update.message.reply_text(
-            f"*Status*\n"
-            f"Channel: `{channel['channel_id']}`\n"
-            f"Name: {channel.get('channel_name') or '-'}\n"
-            f"Mode: {status}\n"
-            f"Per post: {channel['min_reactions']}-{channel['max_reactions']}\n"
-            f"Max delay: {channel['max_delay_minutes']} min\n"
-            f"Active bots: {len(self.reaction_manager.bot_instances)}",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    # =========================================================
+    # MAIN MENU
+    # =========================================================
 
-    @admin_only
-    async def cmd_set_count(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if len(context.args) != 2:
-            await update.message.reply_text(
-                "Usage: `/set_count <channel_id> <1-15>`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        cid = context.args[0]
-        try:
-            n = int(context.args[1])
-            if not 1 <= n <= 15:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Count must be 1-15.")
-            return
-        if not await self.db.get_channel(cid):
-            await update.message.reply_text("Channel not registered.")
-            return
-        lo = max(1, n - 2)
-        await self.db.update_channel_count(cid, lo, n)
-        await update.message.reply_text(f"Set to {lo}-{n} reactions per post.")
+    def main_menu_keyboard(self):
 
-    @admin_only
-    async def cmd_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        channels = await self.db.get_all_channels()
-        if not channels:
-            await update.message.reply_text("No channels registered.")
-            return
-        lines = ["*Channels*", ""]
-        for i, ch in enumerate(channels, 1):
-            status = "ON" if ch['react_mode'] else "OFF"
-            lines.append(
-                f"{i}. [{status}] `{ch['channel_id']}` - "
-                f"{(ch.get('channel_name') or '')[:30]} "
-                f"({ch['min_reactions']}-{ch['max_reactions']})"
-            )
-        await update.message.reply_text("\n".join(lines),
-                                        parse_mode=ParseMode.MARKDOWN)
+        return InlineKeyboardMarkup([
 
-    @admin_only
-    async def cmd_add_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text("Usage: `/add_bot <token>`",
-                                            parse_mode=ParseMode.MARKDOWN)
-            return
-        if await self.db.count_bots() >= self.config.MAX_BOTS:
-            await update.message.reply_text("Bot limit reached.")
-            return
-        try:
-            username = await self.reaction_manager.add_bot(context.args[0])
-            await update.message.reply_text(
-                f"Added @{username}\n"
-                f"Active: {len(self.reaction_manager.bot_instances)}"
-            )
-        except Exception as e:
-            await update.message.reply_text(f"Invalid token: {e}")
-
-    @admin_only
-    async def cmd_list_bots(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        bots = await self.db.get_active_bots()
-        if not bots:
-            await update.message.reply_text("No active bots.")
-            return
-        lines = ["*Active Bots*", ""]
-        for i, b in enumerate(bots, 1):
-            lines.append(
-                f"{i}. @{b['bot_username']} - "
-                f"{b['reactions_today']}/{b['daily_limit']} today"
-            )
-        await update.message.reply_text("\n".join(lines),
-                                        parse_mode=ParseMode.MARKDOWN)
-
-    @admin_only
-    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        s = await self.db.get_stats()
-        rate = (s['successful'] / s['total'] * 100) if s['total'] else 0.0
-        await update.message.reply_text(
-            f"*Daily Stats*\n"
-            f"Total: {s['total']}\n"
-            f"Success: {s['successful']}\n"
-            f"Failed: {s['failed']}\n"
-            f"Rate: {rate:.1f}%\n"
-            f"Active bots: {len(self.reaction_manager.bot_instances)}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    async def _set_mode(self, update, context, mode: bool):
-        if not context.args:
-            cmd = 'react_on' if mode else 'react_off'
-            await update.message.reply_text(
-                f"Usage: `/{cmd} <channel_id>`", parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        cid = context.args[0]
-        if not await self.db.get_channel(cid):
-            await update.message.reply_text("Channel not registered.")
-            return
-        await self.db.update_channel_react_mode(cid, mode)
-        await update.message.reply_text(
-            f"{'ENABLED' if mode else 'DISABLED'} for `{cid}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    async def show_control_panel(self, update, context, edit=False):
-        channels = await self.db.get_all_channels()
-        if not channels:
-            text = "No channels yet. Add one with `/add_channel <id> <name>`."
-            if edit and update.callback_query:
-                await update.callback_query.edit_message_text(
-                    text, parse_mode=ParseMode.MARKDOWN
+            [
+                InlineKeyboardButton(
+                    "📢 Channels",
+                    callback_data="menu:channels"
                 )
-            else:
-                await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "📊 Statistics",
+                    callback_data="menu:stats"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "⚙️ Settings",
+                    callback_data="menu:settings"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "❓ Help",
+                    callback_data="menu:help"
+                )
+            ],
+
+        ])
+
+    async def cmd_start(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+
+        user = update.effective_user
+
+        if not user or user.id not in self.config.ADMIN_USER_IDS:
+            await update.effective_message.reply_text(
+                "⛔ You are not authorized to use this bot."
+            )
             return
+
+        await update.effective_message.reply_text(
+            "🤖 *CONTROL CENTER*\n\n"
+            "Welcome! Choose what you want to manage below.",
+            reply_markup=self.main_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # =========================================================
+    # CHANNEL MENU
+    # =========================================================
+
+    async def show_channels(
+        self,
+        query
+    ):
+
+        channels = await self.db.get_all_channels()
 
         rows = []
-        for ch in channels:
-            status = "ON " if ch['react_mode'] else "OFF"
-            label = f"[{status}] {ch.get('channel_name') or ch['channel_id']}"
-            rows.append([InlineKeyboardButton(
-                label, callback_data=f"view:{ch['channel_id']}"
-            )])
-        kb = InlineKeyboardMarkup(rows)
-        text = "*Reaction Control Panel*\nSelect a channel:"
-        if edit and update.callback_query:
-            await update.callback_query.edit_message_text(
-                text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(
-                text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN
-            )
 
-    async def _build_channel_panel(self, channel: Dict):
-        status = "ENABLED" if channel['react_mode'] else "DISABLED"
-        stats = await self.db.get_stats(channel['channel_id'])
-        emojis = (channel.get('emoji_list') or '')[:40]
-        text = (
-            f"*Channel Panel*\n"
-            f"Channel: `{channel['channel_id']}`\n"
-            f"Name: {channel.get('channel_name') or '-'}\n"
-            f"Auto: {status}\n"
-            f"Per post: {channel['min_reactions']}-{channel['max_reactions']}\n"
-            f"Emojis: {emojis}\n\n"
-            f"Today - OK {stats['successful']} / FAIL {stats['failed']}"
-        )
-        cid = channel['channel_id']
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Toggle", callback_data=f"toggle:{cid}")],
-            [InlineKeyboardButton("Stats", callback_data=f"stats:{cid}")],
-            [InlineKeyboardButton("Back", callback_data="back")],
+        if channels:
+
+            for channel in channels:
+
+                status = (
+                    "🟢"
+                    if channel["react_mode"]
+                    else "🔴"
+                )
+
+                name = (
+                    channel.get("channel_name")
+                    or channel["channel_id"]
+                )
+
+                rows.append([
+                    InlineKeyboardButton(
+                        f"{status} {name}",
+                        callback_data=(
+                            f"channel:{channel['channel_id']}"
+                        )
+                    )
+                ])
+
+        rows.append([
+            InlineKeyboardButton(
+                "➕ Add Channel",
+                callback_data="channel_add"
+            )
         ])
-        return text, kb
 
-    @admin_only
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        q = update.callback_query
-        await q.answer()
-        data = q.data or ""
+        rows.append([
+            InlineKeyboardButton(
+                "🏠 Main Menu",
+                callback_data="menu:home"
+            )
+        ])
 
-        if data == "back":
-            await self.show_control_panel(update, context, edit=True)
-            return
+        text = (
+            "📢 *CHANNELS*\n\n"
+            "Select a channel to manage it."
+        )
 
-        if ":" not in data:
-            return
-        action, cid = data.split(":", 1)
+        if not channels:
+            text += (
+                "\n\nYou haven't added any channels yet."
+            )
 
-        channel = await self.db.get_channel(cid)
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # =========================================================
+    # CHANNEL PANEL
+    # =========================================================
+
+    async def show_channel_panel(
+        self,
+        query,
+        channel_id
+    ):
+
+        channel = await self.db.get_channel(channel_id)
+
         if not channel:
-            await q.edit_message_text("Channel no longer registered.")
+
+            await query.edit_message_text(
+                "❌ Channel not found.",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "◀️ Back",
+                            callback_data="menu:channels"
+                        )
+                    ]
+                ])
+            )
+
             return
 
-        if action == "view":
-            text, kb = await self._build_channel_panel(channel)
-            await q.edit_message_text(text, reply_markup=kb,
-                                      parse_mode=ParseMode.MARKDOWN)
+        status = (
+            "🟢 ON"
+            if channel["react_mode"]
+            else "🔴 OFF"
+        )
 
-        elif action == "toggle":
-            new_mode = not bool(channel['react_mode'])
-            await self.db.update_channel_react_mode(cid, new_mode)
-            channel = await self.db.get_channel(cid)
-            text, kb = await self._build_channel_panel(channel)
-            await q.edit_message_text(text, reply_markup=kb,
-                                      parse_mode=ParseMode.MARKDOWN)
+        stats = await self.db.get_stats(channel_id)
 
-        elif action == "stats":
-            s = await self.db.get_stats(cid)
-            await q.edit_message_text(
-                f"*Channel Stats*\n"
-                f"Total: {s['total']}\n"
-                f"OK: {s['successful']}  FAIL: {s['failed']}",
+        name = (
+            channel.get("channel_name")
+            or channel["channel_id"]
+        )
+
+        text = (
+            f"📢 *{name}*\n\n"
+
+            f"Status: {status}\n"
+            f"Reactions/post: "
+            f"{channel['min_reactions']}-"
+            f"{channel['max_reactions']}\n"
+            f"Max delay: "
+            f"{channel['max_delay_minutes']} minutes\n\n"
+
+            f"📊 Today's statistics\n"
+            f"Successful: {stats['successful']}\n"
+            f"Failed: {stats['failed']}"
+        )
+
+        toggle_text = (
+            "🔴 Turn OFF"
+            if channel["react_mode"]
+            else "🟢 Turn ON"
+        )
+
+        keyboard = [
+
+            [
+                InlineKeyboardButton(
+                    toggle_text,
+                    callback_data=f"toggle:{channel_id}"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "📊 Statistics",
+                    callback_data=f"stats:{channel_id}"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "◀️ Back",
+                    callback_data="menu:channels"
+                )
+            ],
+
+        ]
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # =========================================================
+    # STATISTICS
+    # =========================================================
+
+    async def show_statistics(self, query):
+
+        stats = await self.db.get_stats()
+
+        total = stats["total"]
+        successful = stats["successful"]
+        failed = stats["failed"]
+
+        if total:
+            success_rate = (
+                successful / total
+            ) * 100
+        else:
+            success_rate = 0
+
+        text = (
+            "📊 *STATISTICS*\n\n"
+
+            f"Total attempts: `{total}`\n"
+            f"Successful: `{successful}`\n"
+            f"Failed: `{failed}`\n"
+            f"Success rate: `{success_rate:.1f}%`\n\n"
+
+            f"Active bot connections: "
+            f"`{len(self.reaction_manager.bot_instances)}`"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="menu:home"
+                )
+            ]
+
+        ])
+
+        await query.edit_message_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # =========================================================
+    # SETTINGS
+    # =========================================================
+
+    async def show_settings(self, query):
+
+        text = (
+            "⚙️ *SETTINGS*\n\n"
+
+            "Your current global configuration:\n\n"
+
+            f"Maximum connected accounts: "
+            f"`{self.config.MAX_BOTS}`\n"
+
+            f"Default daily limit: "
+            f"`{self.config.DAILY_LIMIT_PER_BOT}`\n\n"
+
+            "Channel-specific settings can be "
+            "managed from the channel panel."
+        )
+
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "📢 Manage Channels",
+                    callback_data="menu:channels"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="menu:home"
+                )
+            ]
+
+        ])
+
+        await query.edit_message_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # =========================================================
+    # HELP
+    # =========================================================
+
+    async def show_help(self, query):
+
+        text = (
+            "❓ *HOW TO USE THE BOT*\n\n"
+
+            "📢 *Channels*\n"
+            "Add and manage the channels connected "
+            "to the system.\n\n"
+
+            "📊 *Statistics*\n"
+            "See today's activity and success rate.\n\n"
+
+            "⚙️ *Settings*\n"
+            "View the current configuration.\n\n"
+
+            "Everything important can be accessed "
+            "from the buttons, so you don't need "
+            "to memorize commands."
+        )
+
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="menu:home"
+                )
+            ]
+
+        ])
+
+        await query.edit_message_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # =========================================================
+    # CALLBACK HANDLER
+    # =========================================================
+
+    async def handle_callback(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+
+        query = update.callback_query
+
+        user = query.from_user
+
+        if user.id not in self.config.ADMIN_USER_IDS:
+
+            await query.answer(
+                "⛔ Unauthorized.",
+                show_alert=True
+            )
+
+            return
+
+        await query.answer()
+
+        data = query.data or ""
+
+        # -------------------------
+        # MAIN MENU
+        # -------------------------
+
+        if data == "menu:home":
+
+            await query.edit_message_text(
+                "🤖 *CONTROL CENTER*\n\n"
+                "Choose an option:",
+                reply_markup=self.main_menu_keyboard(),
                 parse_mode=ParseMode.MARKDOWN
             )
 
-    async def handle_channel_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        channel_id = str(update.effective_chat.id)
-        if not await self.db.get_channel(channel_id):
             return
-        msg = update.effective_message
-        post_text = msg.text or msg.caption or ""
-        await self.reaction_manager.schedule_reactions(
-            channel_id, msg.message_id, post_text
+
+        # -------------------------
+        # CHANNEL LIST
+        # -------------------------
+
+        if data == "menu:channels":
+
+            await self.show_channels(query)
+
+            return
+
+        # -------------------------
+        # STATISTICS
+        # -------------------------
+
+        if data == "menu:stats":
+
+            await self.show_statistics(query)
+
+            return
+
+        # -------------------------
+        # SETTINGS
+        # -------------------------
+
+        if data == "menu:settings":
+
+            await self.show_settings(query)
+
+            return
+
+        # -------------------------
+        # HELP
+        # -------------------------
+
+        if data == "menu:help":
+
+            await self.show_help(query)
+
+            return
+
+        # -------------------------
+        # ADD CHANNEL
+        # -------------------------
+
+        if data == "channel_add":
+
+            context.user_data["awaiting_channel"] = True
+
+            await query.edit_message_text(
+                "➕ *ADD CHANNEL*\n\n"
+                "Send me the channel ID.\n\n"
+                "Example:\n"
+                "`-1001234567890`\n\n"
+                "You can cancel by sending:\n"
+                "`cancel`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+            return
+
+        # -------------------------
+        # OPEN CHANNEL
+        # -------------------------
+
+        if data.startswith("channel:"):
+
+            channel_id = data.split(":", 1)[1]
+
+            await self.show_channel_panel(
+                query,
+                channel_id
+            )
+
+            return
+
+        # -------------------------
+        # TOGGLE
+        # -------------------------
+
+        if data.startswith("toggle:"):
+
+            channel_id = data.split(":", 1)[1]
+
+            channel = await self.db.get_channel(
+                channel_id
+            )
+
+            if not channel:
+
+                await query.edit_message_text(
+                    "❌ Channel no longer exists."
+                )
+
+                return
+
+            new_mode = not bool(
+                channel["react_mode"]
+            )
+
+            await self.db.update_channel_react_mode(
+                channel_id,
+                new_mode
+            )
+
+            await self.show_channel_panel(
+                query,
+                channel_id
+            )
+
+            return
+
+        # -------------------------
+        # CHANNEL STATS
+        # -------------------------
+
+        if data.startswith("stats:"):
+
+            channel_id = data.split(":", 1)[1]
+
+            stats = await self.db.get_stats(
+                channel_id
+            )
+
+            text = (
+                "📊 *CHANNEL STATISTICS*\n\n"
+                f"Successful: `{stats['successful']}`\n"
+                f"Failed: `{stats['failed']}`\n"
+                f"Total: `{stats['total']}`"
+            )
+
+            keyboard = InlineKeyboardMarkup([
+
+                [
+                    InlineKeyboardButton(
+                        "◀️ Back",
+                        callback_data=f"channel:{channel_id}"
+                    )
+                ]
+
+            ])
+
+            await query.edit_message_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+            return
+
+    # =========================================================
+    # ADD CHANNEL MESSAGE HANDLER
+    # =========================================================
+
+    async def handle_private_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+
+        user = update.effective_user
+
+        if not user:
+            return
+
+        if user.id not in self.config.ADMIN_USER_IDS:
+            return
+
+        if not context.user_data.get(
+            "awaiting_channel"
+        ):
+            return
+
+        text = (
+            update.effective_message.text
+            or ""
+        ).strip()
+
+        if text.lower() == "cancel":
+
+            context.user_data.pop(
+                "awaiting_channel",
+                None
+            )
+
+            await update.effective_message.reply_text(
+                "❌ Cancelled.",
+                reply_markup=self.main_menu_keyboard()
+            )
+
+            return
+
+        if not text.startswith("-100"):
+
+            await update.effective_message.reply_text(
+                "❌ That doesn't look like a Telegram "
+                "channel ID.\n\n"
+                "Channel IDs normally look like:\n"
+                "`-1001234567890`\n\n"
+                "Try again or send `cancel`.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+            return
+
+        channel_id = text
+
+        added = await self.db.add_channel(
+            channel_id,
+            channel_id
         )
 
+        context.user_data.pop(
+            "awaiting_channel",
+            None
+        )
+
+        if added:
+
+            await update.effective_message.reply_text(
+                "✅ *Channel added!*\n\n"
+                f"Channel ID: `{channel_id}`\n\n"
+                "You can now manage it from "
+                "the Channels menu.",
+                reply_markup=InlineKeyboardMarkup([
+
+                    [
+                        InlineKeyboardButton(
+                            "📢 Open Channels",
+                            callback_data="menu:channels"
+                        )
+                    ],
+
+                    [
+                        InlineKeyboardButton(
+                            "🏠 Main Menu",
+                            callback_data="menu:home"
+                        )
+                    ]
+
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        else:
+
+            await update.effective_message.reply_text(
+                "ℹ️ That channel is already registered.",
+                reply_markup=InlineKeyboardMarkup([
+
+                    [
+                        InlineKeyboardButton(
+                            "📢 Open Channels",
+                            callback_data="menu:channels"
+                        )
+                    ]
+
+                ])
+            )
+
+    # =========================================================
+    # CHANNEL POSTS
+    # =========================================================
+
+    async def handle_channel_post(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+
+        channel_id = str(
+            update.effective_chat.id
+        )
+
+        if not await self.db.get_channel(
+            channel_id
+        ):
+            return
+
+        msg = update.effective_message
+
+        post_text = (
+            msg.text
+            or msg.caption
+            or ""
+        )
+
+        await self.reaction_manager.schedule_reactions(
+            channel_id,
+            msg.message_id,
+            post_text
+        )
+
+    # =========================================================
+    # RUN
+    # =========================================================
+
     def run(self):
+
         if self.application is None:
             self.build()
-        logger.info("Starting master bot polling...")
+
+        logger.info(
+            "Starting master bot polling..."
+        )
+
         self.application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
