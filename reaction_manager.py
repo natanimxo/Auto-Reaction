@@ -132,6 +132,13 @@ class ReactionManager:
             + " ".join(plan)
         )
 
+    def min_window_minutes(self, n: int) -> int:
+        """Smallest max-delay window (whole minutes) that can honour the minimum
+        gap for n reactions: the first can't land before 60s, then (n - 1) gaps.
+        Used by the scheduler's warning and by the delay/count pickers in the UI.
+        """
+        return math.ceil((60 + (max(1, n) - 1) * self.min_gap_seconds) / 60)
+
     def _create_staggered_schedule(self, n: int, max_delay_minutes: int) -> List[float]:
         max_seconds = max(60, max_delay_minutes * 60)
         gap = self.min_gap_seconds
@@ -142,7 +149,7 @@ class ReactionManager:
         # minimum gap: warn once and spread evenly over the whole window instead
         # (that is the closest we can get, and it never exceeds max_seconds).
         if n > 1 and 60 + (n - 1) * gap > max_seconds:
-            needed_minutes = math.ceil((60 + (n - 1) * gap) / 60)
+            needed_minutes = self.min_window_minutes(n)
             logger.warning(
                 f"max_delay_minutes={max_delay_minutes} is too low for {n} "
                 f"reactions per post with a {gap}s minimum gap (needs >= "

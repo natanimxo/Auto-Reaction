@@ -213,8 +213,11 @@ class MasterBot:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
 
-        await query.answer()
         data = query.data or ""
+        # A callback query can only be answered once. "savecount:" answers for
+        # itself (it may attach a toast), so every other callback is acked here.
+        if not data.startswith("savecount:"):
+            await query.answer()
 
         try:
             if data == "menu:home":
@@ -280,9 +283,22 @@ class MasterBot:
                 # (Not checked against the number of bots: that happens at
                 # schedule time in ReactionManager.schedule_reactions.)
                 if not 1 <= lo <= hi <= COUNT_PICKER_MAX:
+                    await query.answer()
                     await self._show_count_min_picker(query, cid)
                     return
+                ch = await self.db.get_channel(cid)
                 await self.db.update_channel_count(cid, lo, hi)
+
+                # Advisory only: the save is never blocked. If the channel's
+                # max delay can't fit `hi` reactions at the minimum gap, say so
+                # with a toast (no popup, no change to the panel's layout).
+                notice = None
+                if ch and ch["max_delay_minutes"] < self.reaction_manager.min_window_minutes(hi):
+                    notice = (
+                        f"⚠️ Max delay ({ch['max_delay_minutes']}m) is too low for "
+                        f"{hi} reactions/post — raise it in ⏱ Max delay."
+                    )
+                await query.answer(notice)  # None -> plain ack, no toast
                 await self._show_channel_panel(query, cid)
                 return
             if data.startswith("emoji:"):
@@ -544,11 +560,24 @@ class MasterBot:
         )
 
     async def _show_delay_picker(self, query, channel_id):
-        options = [5, 10, 15, 30, 60, 120]
+        ch = await self.db.get_channel(channel_id)
+        if not ch:
+            await query.edit_message_text("❌ Channel gone.")
+            return
+
+        # Worst case for this channel is max_reactions (a post gets a random
+        # number between min and max). Windows shorter than `needed` minutes
+        # can't keep the minimum gap, so the scheduler would fall back to even
+        # spacing. We flag those options rather than hide them - they still work.
+        max_reactions = ch["max_reactions"]
+        needed = self.reaction_manager.min_window_minutes(max_reactions)
+
+        options = [5, 10, 15, 30, 45, 60, 90, 120]
         rows = []
         row = []
         for m in options:
-            row.append(InlineKeyboardButton(f"{m}m", callback_data=f"setdelay:{channel_id}:{m}"))
+            label = f"⚠️ {m}m" if m < needed else f"{m}m"
+            row.append(InlineKeyboardButton(label, callback_data=f"setdelay:{channel_id}:{m}"))
             if len(row) == 3:
                 rows.append(row)
                 row = []
@@ -558,7 +587,9 @@ class MasterBot:
 
         await query.edit_message_text(
             "⏱ *Max delay*\n\n"
-            "Largest window for staggering reactions across bots.",
+            "Largest window for staggering reactions across bots.\n\n"
+            f"Need >= {needed}m for {max_reactions} reactions/post at the current gap. "
+            "⚠️ = too short, reactions will be spaced evenly instead.",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.MARKDOWN,
         )
