@@ -17,6 +17,8 @@ class Config:
     MAX_REACTIONS_PER_POST = int(os.getenv('MAX_REACTIONS_PER_POST', 11))
     MIN_DELAY_MINUTES = int(os.getenv('MIN_DELAY_MINUTES', 1))
     MAX_DELAY_MINUTES = int(os.getenv('MAX_DELAY_MINUTES', 30))
+    # Minimum seconds between two reactions on the same post (tunable from Railway).
+    MIN_REACTION_GAP_SECONDS = int(os.getenv('MIN_REACTION_GAP_SECONDS', 90))
 
     DEFAULT_EMOJIS = ['👍', '❤', '🔥', '🤣', '😍', '👏', '💯', '🎉', '🤩', '🙏']
 

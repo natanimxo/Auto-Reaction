@@ -37,7 +37,9 @@ def main():
 
     db = Database(Config.DB_PATH)
 
-    reaction_manager = ReactionManager(db)
+    reaction_manager = ReactionManager(
+        db, min_gap_seconds=Config.MIN_REACTION_GAP_SECONDS
+    )
 
     master_bot = MasterBot(
         config=Config,

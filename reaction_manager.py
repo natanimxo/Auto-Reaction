@@ -1,5 +1,6 @@
 # reaction_manager.py
 import asyncio
+import math
 import random
 import logging
 from typing import List, Dict
@@ -9,6 +10,11 @@ from telegram.constants import ReactionEmoji
 from telegram.error import TelegramError, RetryAfter, Forbidden, BadRequest
 
 logger = logging.getLogger(__name__)
+
+# Default minimum spacing (seconds) between two reactions on the same post, so
+# they don't all land within the same minute or two. Deployments override it with
+# the MIN_REACTION_GAP_SECONDS env var (config.py -> main.py -> ReactionManager).
+MIN_GAP_SECONDS = 90
 
 # Telegram only accepts a fixed set of emoji as reactions. Compare against the
 # enum's values, exactly as PTB itself does.
@@ -29,8 +35,9 @@ def normalize_emojis(emojis: List[str]) -> List[str]:
 
 
 class ReactionManager:
-    def __init__(self, database):
+    def __init__(self, database, min_gap_seconds: int = MIN_GAP_SECONDS):
         self.db = database
+        self.min_gap_seconds = max(0, int(min_gap_seconds))
         self.bot_instances: Dict[str, Dict] = {}
         self.active_jobs: Dict[str, asyncio.Task] = {}
 
@@ -127,6 +134,23 @@ class ReactionManager:
 
     def _create_staggered_schedule(self, n: int, max_delay_minutes: int) -> List[float]:
         max_seconds = max(60, max_delay_minutes * 60)
+        gap = self.min_gap_seconds
+
+        # Feasibility check. The first reaction can't land before 60s, and n
+        # reactions need (n - 1) gaps after it, so the window must be at least
+        # 60 + (n - 1) * gap seconds. If it isn't, no schedule can satisfy the
+        # minimum gap: warn once and spread evenly over the whole window instead
+        # (that is the closest we can get, and it never exceeds max_seconds).
+        if n > 1 and 60 + (n - 1) * gap > max_seconds:
+            needed_minutes = math.ceil((60 + (n - 1) * gap) / 60)
+            logger.warning(
+                f"max_delay_minutes={max_delay_minutes} is too low for {n} "
+                f"reactions per post with a {gap}s minimum gap (needs >= "
+                f"{needed_minutes} min); falling back to even spacing"
+            )
+            step = (max_seconds - 60) / (n - 1)
+            return [60 + i * step for i in range(n)]
+
         schedule: List[float] = []
 
         if n <= 3:
@@ -155,7 +179,45 @@ class ReactionManager:
         schedule.sort()
         while len(schedule) < n:
             schedule.append(max_seconds)
-        return schedule[:n]
+        return self._enforce_min_gap(schedule[:n], max_seconds)
+
+    def _enforce_min_gap(self, schedule: List[float], max_seconds: float) -> List[float]:
+        """Keep the bucketed "early burst, then stragglers" shape, but make sure
+        consecutive reactions are at least self.min_gap_seconds apart.
+
+        Assumes the caller already checked that the window is big enough
+        (60 + (n - 1) * gap <= max_seconds).
+        """
+        gap = self.min_gap_seconds
+        n = len(schedule)
+        schedule = sorted(schedule)
+
+        # Pass 1: push anything too close to its predecessor forward. The little
+        # random jitter keeps the spacing from looking mechanical.
+        for i in range(1, n):
+            if schedule[i] - schedule[i - 1] < gap:
+                schedule[i] = schedule[i - 1] + gap + random.uniform(0, 10)
+
+        # Pass 2: pushing may have run past the ceiling. Clipping would stack
+        # reactions at max_seconds, and naively scaling the tail would shrink the
+        # gaps we just enforced. Trick: subtract the mandatory spacing (i * gap)
+        # from each value, so the gap rule becomes "values never decrease" -
+        # any monotonic rescale in that space keeps every gap >= min, and then
+        # add the spacing back.
+        if schedule and schedule[-1] > max_seconds:
+            slack = [v - i * gap for i, v in enumerate(schedule)]
+            limit = max_seconds - (n - 1) * gap   # >= 60 thanks to the caller's check
+            # Overflow point: first reaction that no longer leaves room for the
+            # ones after it. Everything before it is left exactly as it was.
+            k = next(i for i, v in enumerate(slack) if v > limit)
+            anchor = slack[k - 1] if k > 0 else 60.0
+            factor = (limit - anchor) / (slack[-1] - anchor)
+            for i in range(k, n):
+                slack[i] = anchor + (slack[i] - anchor) * factor
+            schedule = [v + i * gap for i, v in enumerate(slack)]
+
+        # Float rounding can leave the last value a hair over max_seconds.
+        return [min(v, max_seconds) for v in schedule]
 
     async def _delayed_reaction(self, channel_id: str, post_id: int,
                                 bot_username: str, emoji: str, delay: float):

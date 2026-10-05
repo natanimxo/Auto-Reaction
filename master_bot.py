@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+# Upper bound offered by the reactions-per-post pickers (same 1-15 range as before).
+COUNT_PICKER_MAX = 15
+
 DEFAULT_EMOJIS = ['👍', '❤', '🔥', '🤣', '😍', '👏', '💯', '🎉', '🤩', '🙏']
 
 
@@ -254,15 +257,32 @@ class MasterBot:
                 await self.db.update_channel_react_mode(cid, not bool(ch["react_mode"]))
                 await self._show_channel_panel(query, cid)
                 return
-            if data.startswith("count:"):
+            # Reactions per post is a two-step picker: choose MIN, then choose MAX.
+            # The chosen min travels inside callback_data, so no per-user state
+            # has to be stored between the two taps.
+            if data.startswith("countmin:"):
                 cid = data.split(":", 1)[1]
-                await self._show_count_picker(query, cid)
+                await self._show_count_min_picker(query, cid)
                 return
-            if data.startswith("setcount:"):
-                _, cid, val = data.split(":", 2)
-                n = int(val)
-                lo = max(1, n - 2)
-                await self.db.update_channel_count(cid, lo, n)
+            if data.startswith("setcountmax:"):
+                _, cid, lo = data.split(":", 2)
+                lo = int(lo)
+                if not 1 <= lo <= COUNT_PICKER_MAX:
+                    await self._show_count_min_picker(query, cid)
+                    return
+                await self._show_count_max_picker(query, cid, lo)
+                return
+            if data.startswith("savecount:"):
+                _, cid, lo, hi = data.split(":", 3)
+                lo, hi = int(lo), int(hi)
+                # callback_data comes from the client, so re-check the range here
+                # rather than trusting that only our own buttons can send it.
+                # (Not checked against the number of bots: that happens at
+                # schedule time in ReactionManager.schedule_reactions.)
+                if not 1 <= lo <= hi <= COUNT_PICKER_MAX:
+                    await self._show_count_min_picker(query, cid)
+                    return
+                await self.db.update_channel_count(cid, lo, hi)
                 await self._show_channel_panel(query, cid)
                 return
             if data.startswith("emoji:"):
@@ -424,7 +444,7 @@ class MasterBot:
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(toggle_text, callback_data=f"toggle:{channel_id}")],
-            [InlineKeyboardButton("🔢 Reactions per post", callback_data=f"count:{channel_id}")],
+            [InlineKeyboardButton("🔢 Reactions per post", callback_data=f"countmin:{channel_id}")],
             [InlineKeyboardButton("😀 Emojis", callback_data=f"emoji:{channel_id}")],
             [InlineKeyboardButton("⏱ Max delay", callback_data=f"delay:{channel_id}")],
             [InlineKeyboardButton("📊 Stats", callback_data=f"stats:{channel_id}")],
@@ -451,11 +471,12 @@ class MasterBot:
         ]])
         await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
-    async def _show_count_picker(self, query, channel_id):
+    async def _show_count_min_picker(self, query, channel_id):
+        # Step 1 of 2: every button forwards its value as the pending min.
         rows = []
         row = []
-        for n in range(1, 16):
-            row.append(InlineKeyboardButton(str(n), callback_data=f"setcount:{channel_id}:{n}"))
+        for n in range(1, COUNT_PICKER_MAX + 1):
+            row.append(InlineKeyboardButton(str(n), callback_data=f"setcountmax:{channel_id}:{n}"))
             if len(row) == 5:
                 rows.append(row)
                 row = []
@@ -464,8 +485,30 @@ class MasterBot:
         rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"channel:{channel_id}")])
 
         await query.edit_message_text(
-            "🔢 *How many reactions per post?*\n\n"
-            "Pick a number (1–15). Higher = more bots react.",
+            "🔢 *Reactions per post - step 1 of 2*\n\n"
+            f"Pick the *minimum* (1–{COUNT_PICKER_MAX}). Each post gets a random "
+            "number of reactions between your min and max.",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    async def _show_count_max_picker(self, query, channel_id, lo):
+        # Step 2 of 2: only offer values >= min, so min <= max by construction.
+        rows = []
+        row = []
+        for n in range(lo, COUNT_PICKER_MAX + 1):
+            row.append(InlineKeyboardButton(str(n), callback_data=f"savecount:{channel_id}:{lo}:{n}"))
+            if len(row) == 5:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        # Back goes to step 1 so a wrong min can be re-picked.
+        rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"countmin:{channel_id}")])
+
+        await query.edit_message_text(
+            "🔢 *Reactions per post - step 2 of 2*\n\n"
+            f"Minimum: `{lo}`. Now pick the *maximum* ({lo}–{COUNT_PICKER_MAX}).",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.MARKDOWN,
         )
